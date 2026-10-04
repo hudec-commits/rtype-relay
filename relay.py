@@ -6,9 +6,19 @@ the game: it only pairs a host with a client in a room.
     python relay.py                 # ws://localhost:8787 (PORT env overrides, as on Render / fly.io)
 
 Protocol (JSON text frames, "t" = type). The first message of a connection:
-    {"t":"create"[,"room":"TEST"]}  -> {"t":"created","room":"ABCD"}        the sender is the host
+    {"t":"create"[,"room":"TEST"][,"public":true]}
+                                    -> {"t":"created","room":"ABCD"}        the sender is the host; a public
+                                       room is listed and random players may join it
     {"t":"join","room":"ABCD"}      -> {"t":"joined","room":"ABCD"} to the client, {"t":"peer"} to the host
                                     or {"t":"error","msg":"no such room" | "room full"}
+    {"t":"join","room":"*"}         -> joins the public room that has waited longest for a second player,
+                                       or {"t":"error","msg":"no open room"}
+    {"t":"list"}                    -> {"t":"rooms","online":N,"rooms":[{"room","players","open","age"}]}
+                                       (public rooms only; the connection stays for more "list" requests).
+                                       The first one also gets {"t":"history","lines":[{"name","text"}]}
+    {"t":"say","name","text"}       -> lobby chat: {"t":"said","name","text"} to every lobby connection
+                                       (the last HISTORY lines are kept for newcomers)
+In a room the players' own {"t":"chat",...} messages are relayed like everything else.
 Then everything the host sends goes to the client and the other way round, untouched. When the host
 leaves, the client gets {"t":"left","host":true} and the room is gone; when the client leaves, the host
 gets {"t":"left"} and keeps the room for a new client.
@@ -24,7 +34,11 @@ import time
 import websockets
 
 ALPHABET = "".join(c for c in string.ascii_uppercase if c not in "IO")
-rooms = {}          # code -> {"host": ws, "client": ws | None}
+rooms = {}          # code -> {"host": ws, "client": ws | None, "public": bool, "since": time}
+connections = 0
+lobby = set()       # connections browsing the rooms (they get the lobby chat)
+history = []        # the last lobby chat lines
+HISTORY = 40
 
 
 def log(*parts):
@@ -38,22 +52,55 @@ async def send(ws, obj):
         pass
 
 
+def room_list():
+    now = time.time()
+    out = []
+    for code, room in sorted(rooms.items(), key=lambda kv: kv[1]["since"]):
+        if not room["public"]:
+            continue
+        out.append({"room": code, "players": 1 if room["client"] is None else 2,
+                    "open": room["client"] is None, "age": int(now - room["since"])})
+    return {"t": "rooms", "online": connections, "rooms": out}
+
+
 async def handle(ws):
+    global connections
+    connections += 1
     role, code = None, None
     try:
         first = json.loads(await ws.recv())
+        while first.get("t") in ("list", "say"):      # a lobby browsing the rooms and chatting
+            if ws not in lobby:
+                lobby.add(ws)
+                await send(ws, {"t": "history", "lines": history})
+            if first["t"] == "list":
+                await send(ws, room_list())
+            else:
+                line = {"name": str(first.get("name") or "?")[:16], "text": str(first.get("text") or "")[:120]}
+                if line["text"].strip():
+                    history.append(line)
+                    del history[:-HISTORY]
+                    for other in list(lobby):
+                        await send(other, dict(line, t="said"))
+            first = json.loads(await ws.recv())
         if first.get("t") == "create":
             code = str(first.get("room") or "").upper()[:4]
             if not code or code in rooms:
                 code = "".join(random.choice(ALPHABET) for _ in range(4))
                 while code in rooms:
                     code = "".join(random.choice(ALPHABET) for _ in range(4))
-            rooms[code] = {"host": ws, "client": None}
+            rooms[code] = {"host": ws, "client": None, "public": bool(first.get("public")), "since": time.time()}
             role = "host"
             await send(ws, {"t": "created", "room": code})
-            log("room", code, "created", ws.remote_address)
+            log("room", code, "created", "public" if rooms[code]["public"] else "private", ws.remote_address)
         elif first.get("t") == "join":
             code = str(first.get("room") or "").upper()
+            if code == "*":                   # random: the public room waiting longest
+                open_rooms = [(r["since"], c) for c, r in rooms.items() if r["public"] and r["client"] is None]
+                if not open_rooms:
+                    await send(ws, {"t": "error", "msg": "no open room"})
+                    return
+                code = min(open_rooms)[1]
             room = rooms.get(code)
             if room is None:
                 await send(ws, {"t": "error", "msg": "no such room"})
@@ -83,6 +130,8 @@ async def handle(ws):
     except (websockets.ConnectionClosed, json.JSONDecodeError, asyncio.CancelledError):
         pass
     finally:
+        connections -= 1
+        lobby.discard(ws)
         room = rooms.get(code) if code else None
         if room is not None and role == "host":
             del rooms[code]
