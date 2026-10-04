@@ -18,6 +18,9 @@ Protocol (JSON text frames, "t" = type). The first message of a connection:
                                        The first one also gets {"t":"history","lines":[{"name","text"}]}
     {"t":"say","name","text"}       -> lobby chat: {"t":"said","name","text"} to every lobby connection
                                        (the last HISTORY lines are kept for newcomers)
+Every first message may carry "name". The lobby gets events as {"t":"said","sys":true,"text","ts"}
+(ts = unix time, also in the history): someone online / gone, a public room opened, joined, left, closed. "peer" tells the host the client's name, "joined"
+tells the client the host's.
 In a room the players' own {"t":"chat",...} messages are relayed like everything else.
 Then everything the host sends goes to the client and the other way round, untouched. When the host
 leaves, the client gets {"t":"left","host":true} and the room is gone; when the client leaves, the host
@@ -36,7 +39,7 @@ import websockets
 ALPHABET = "".join(c for c in string.ascii_uppercase if c not in "IO")
 rooms = {}          # code -> {"host": ws, "client": ws | None, "public": bool, "since": time}
 connections = 0
-lobby = set()       # connections browsing the rooms (they get the lobby chat)
+lobby = {}          # connections browsing the rooms (they get the lobby chat) -> the name they gave
 history = []        # the last lobby chat lines
 HISTORY = 40
 
@@ -63,6 +66,20 @@ def room_list():
     return {"t": "rooms", "online": connections, "rooms": out}
 
 
+def clean_name(v):
+    return str(v or "").strip()[:16] or "?"
+
+
+async def lobby_event(text, skip=None):
+    """A line of the lobby log to everyone browsing (kept in the history like chat)."""
+    line = {"name": "", "text": text, "sys": True, "ts": int(time.time())}
+    history.append(line)
+    del history[:-HISTORY]
+    for other in list(lobby):
+        if other is not skip:
+            await send(other, dict(line, t="said"))
+
+
 async def handle(ws):
     global connections
     connections += 1
@@ -71,8 +88,9 @@ async def handle(ws):
         first = json.loads(await ws.recv())
         while first.get("t") in ("list", "say"):      # a lobby browsing the rooms and chatting
             if ws not in lobby:
-                lobby.add(ws)
+                lobby[ws] = clean_name(first.get("name"))
                 await send(ws, {"t": "history", "lines": history})
+                await lobby_event(f"{lobby[ws]} is online", skip=ws)
             if first["t"] == "list":
                 await send(ws, room_list())
             else:
@@ -89,10 +107,13 @@ async def handle(ws):
                 code = "".join(random.choice(ALPHABET) for _ in range(4))
                 while code in rooms:
                     code = "".join(random.choice(ALPHABET) for _ in range(4))
-            rooms[code] = {"host": ws, "client": None, "public": bool(first.get("public")), "since": time.time()}
+            rooms[code] = {"host": ws, "client": None, "public": bool(first.get("public")), "since": time.time(),
+                           "host_name": clean_name(first.get("name")), "client_name": ""}
             role = "host"
             await send(ws, {"t": "created", "room": code})
             log("room", code, "created", "public" if rooms[code]["public"] else "private", ws.remote_address)
+            if rooms[code]["public"]:
+                await lobby_event(f"{rooms[code]['host_name']} opened room {code}")
         elif first.get("t") == "join":
             code = str(first.get("room") or "").upper()
             if code == "*":                   # random: the public room waiting longest
@@ -109,9 +130,12 @@ async def handle(ws):
                 await send(ws, {"t": "error", "msg": "room full"})
                 return
             room["client"] = ws
+            room["client_name"] = clean_name(first.get("name"))
             role = "client"
-            await send(ws, {"t": "joined", "room": code})
-            await send(room["host"], {"t": "peer"})
+            await send(ws, {"t": "joined", "room": code, "host": room["host_name"]})
+            await send(room["host"], {"t": "peer", "name": room["client_name"]})
+            if room["public"]:
+                await lobby_event(f"{room['client_name']} joined {room['host_name']} in room {code}")
             log("room", code, "joined", ws.remote_address)
         else:
             await send(ws, {"t": "error", "msg": "create or join first"})
@@ -131,7 +155,9 @@ async def handle(ws):
         pass
     finally:
         connections -= 1
-        lobby.discard(ws)
+        gone = lobby.pop(ws, None)
+        if gone is not None:
+            await lobby_event(f"{gone} left")
         room = rooms.get(code) if code else None
         if room is not None and role == "host":
             del rooms[code]
@@ -139,10 +165,14 @@ async def handle(ws):
                 await send(room["client"], {"t": "left", "host": True})
                 await room["client"].close()
             log("room", code, "closed by host")
+            if room["public"]:
+                await lobby_event(f"room {code} closed")
         elif room is not None and role == "client" and room["client"] is ws:
             room["client"] = None
-            await send(room["host"], {"t": "left"})
+            await send(room["host"], {"t": "left", "name": room["client_name"]})
             log("room", code, "client left")
+            if room["public"]:
+                await lobby_event(f"{room['client_name']} left room {code}")
 
 
 async def main():
