@@ -18,6 +18,9 @@ Protocol (JSON text frames, "t" = type). The first message of a connection:
                                        The first one also gets {"t":"history","lines":[{"name","text"}]}
     {"t":"say","name","text"}       -> lobby chat: {"t":"said","name","text"} to every lobby connection
                                        (the last HISTORY lines are kept for newcomers)
+    {"t":"status","name","mode","score","stage","lives"}   a running game's state, again every few seconds on the
+                                       same connection; "rooms" carries "players": who is playing (with the
+                                       score), in a room, on the title screen
     {"t":"note","text"}             -> a line for the lobby log from a game ("PETR started a single game",
                                        "PETR game over - score 12300 (stage 2)"), then the connection closes
 Every first message may carry "name". The lobby gets events as {"t":"said","sys":true,"text","ts"}
@@ -43,6 +46,8 @@ rooms = {}          # code -> {"host": ws, "client": ws | None, "public": bool, 
 connections = 0
 lobby = {}          # connections browsing the rooms (they get the lobby chat) -> the name they gave
 history = []        # the last lobby chat lines
+playing = {}        # status connections of running games -> {"name", "mode", "score", "stage", "lives", "seen"}
+STATUS_TIMEOUT = 15
 HISTORY = 40
 
 
@@ -65,7 +70,37 @@ def room_list():
             continue
         out.append({"room": code, "players": 1 if room["client"] is None else 2,
                     "open": room["client"] is None, "age": int(now - room["since"])})
-    return {"t": "rooms", "online": connections, "rooms": out}
+    return {"t": "rooms", "online": connections, "rooms": out, "players": player_list()}
+
+
+def player_list():
+    """Who is around: games that tell their state (score, stage, lives), the rooms, the title screens."""
+    now = time.time()
+    out, named = [], set()
+    for ws, st in list(playing.items()):
+        if now - st["seen"] > STATUS_TIMEOUT:
+            continue
+        out.append({"name": st["name"], "where": "playing", "mode": st["mode"], "score": st["score"],
+                    "stage": st["stage"], "lives": st["lives"]})
+        named.update(n.strip() for n in st["name"].split("+"))
+    for code, room in rooms.items():
+        names = [room["host_name"]] + ([room["client_name"]] if room["client"] is not None else [])
+        if all(n in named for n in names):
+            continue
+        out.append({"name": " + ".join(names), "where": "room", "room": code if room["public"] else "",
+                    "full": room["client"] is not None})
+        named.update(names)
+    for ws, name in list(lobby.items()):
+        if name not in named:
+            out.append({"name": name, "where": "title"})
+    return out
+
+
+def to_int(v, default):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def clean_name(v):
@@ -95,6 +130,13 @@ async def handle(ws):
                 await lobby_event(text)
                 log("note", text)
             return
+        if first.get("t") == "status":
+            # a running game tells its state every few seconds over a connection of its own
+            while True:
+                playing[ws] = {"name": str(first.get("name") or "?")[:40], "mode": str(first.get("mode") or "single")[:8],
+                               "score": str(first.get("score") or "0")[:24], "stage": to_int(first.get("stage"), 1),
+                               "lives": to_int(first.get("lives"), 0), "seen": time.time()}
+                first = json.loads(await ws.recv())
         while first.get("t") in ("list", "say"):      # a lobby browsing the rooms and chatting
             if ws not in lobby:
                 lobby[ws] = clean_name(first.get("name"))
@@ -164,6 +206,7 @@ async def handle(ws):
         pass
     finally:
         connections -= 1
+        playing.pop(ws, None)
         gone = lobby.pop(ws, None)
         if gone is not None:
             await lobby_event(f"{gone} left")
