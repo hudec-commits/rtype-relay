@@ -18,6 +18,8 @@ Protocol (JSON text frames, "t" = type). The first message of a connection:
                                        The first one also gets {"t":"history","lines":[{"name","text"}]}
     {"t":"say","name","text"}       -> lobby chat: {"t":"said","name","text"} to every lobby connection
                                        (the last HISTORY lines are kept for newcomers)
+    {"t":"note","text"}             -> a line for the lobby log from a game ("PETR started a single game",
+                                       "PETR game over - score 12300 (stage 2)"), then the connection closes
 Every first message may carry "name". The lobby gets events as {"t":"said","sys":true,"text","ts"}
 (ts = unix time, also in the history): someone online / gone, a public room opened, joined, left, closed. "peer" tells the host the client's name, "joined"
 tells the client the host's.
@@ -86,6 +88,13 @@ async def handle(ws):
     role, code = None, None
     try:
         first = json.loads(await ws.recv())
+        if first.get("t") == "note":
+            # a line for the lobby's log from a game (started, game over with the score): told, then gone
+            text = str(first.get("text") or "")[:120].strip()
+            if text:
+                await lobby_event(text)
+                log("note", text)
+            return
         while first.get("t") in ("list", "say"):      # a lobby browsing the rooms and chatting
             if ws not in lobby:
                 lobby[ws] = clean_name(first.get("name"))
