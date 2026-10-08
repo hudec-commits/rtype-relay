@@ -13,7 +13,8 @@ Protocol (JSON text frames, "t" = type). The first message of a connection:
                                     or {"t":"error","msg":"no such room" | "room full"}
     {"t":"join","room":"*"}         -> joins the public room that has waited longest for a second player,
                                        or {"t":"error","msg":"no open room"}
-    {"t":"list"}                    -> {"t":"rooms","online":N,"rooms":[{"room","players","open","age"}]}
+    {"t":"list"}                    -> {"t":"rooms","online":N,"rooms":[{"room","players","open","age"}],"players":[...]}
+                                       (online = people in "players", a co-op pair two; "connections" = sockets)
                                        (public rooms only; the connection stays for more "list" requests).
                                        The first one also gets {"t":"history","lines":[{"name","text"}]}
     {"t":"say","name","text"}       -> lobby chat: {"t":"said","name","text"} to every lobby connection
@@ -70,7 +71,10 @@ def room_list():
             continue
         out.append({"room": code, "players": 1 if room["client"] is None else 2,
                     "open": room["client"] is None, "age": int(now - room["since"])})
-    return {"t": "rooms", "online": connections, "rooms": out, "players": player_list()}
+    players = player_list()
+    # people, not connections: a game has a second connection for its status, a room host one more
+    online = sum(len(p["name"].split("+")) for p in players)
+    return {"t": "rooms", "online": online, "connections": connections, "rooms": out, "players": players}
 
 
 def player_list():
